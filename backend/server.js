@@ -14,9 +14,9 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 
 // Database connection
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch((err) => console.error('MongoDB connection error:', err));
+mongoose.connect(process.env.DATABASE)
+  .then(() => console.log('MongoDB Connected Successfully'))
+  .catch(err => console.log('MongoDB connection error:', err));
 
 // Basic route
 app.get('/', (req, res) => {

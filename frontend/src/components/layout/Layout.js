@@ -1,30 +1,24 @@
 import React, { useState } from 'react';
+import { Layout as AntLayout } from 'antd';
 import { Outlet } from 'react-router-dom';
-import { Box, CssBaseline } from '@mui/material';
 import Navbar from './Navbar';
 import Sidebar from './Sidebar';
 
+const { Content } = AntLayout;
+
 const Layout = () => {
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
 
   return (
-    <Box sx={{ display: 'flex' }}>
-      <CssBaseline />
-      <Navbar onMenuClick={() => setSidebarOpen(!sidebarOpen)} />
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-      <Box
-        component="main"
-        sx={{
-          flexGrow: 1,
-          p: 3,
-          mt: 8,
-          backgroundColor: '#f5f5f5',
-          minHeight: '100vh'
-        }}
-      >
-        <Outlet />
-      </Box>
-    </Box>
+    <AntLayout style={{ minHeight: '100vh' }}>
+      <Navbar collapsed={collapsed} setCollapsed={setCollapsed} />
+      <AntLayout>
+        <Sidebar collapsed={collapsed} />
+        <Content style={{ margin: '24px 16px', padding: 24, minHeight: 280 }}>
+          <Outlet />
+        </Content>
+      </AntLayout>
+    </AntLayout>
   );
 };
 

@@ -1,0 +1,10 @@
+export { default as Dashboard } from './Dashboard';
+export { default as Members } from './Members';
+export { default as Events } from './Events';
+export { default as Finance } from './Finance';
+export { default as Login } from './Login';
+export { default as Register } from './Register';
+export { default as Attendance } from './Attendance';
+export { default as Blog } from './Blog';
+export { default as PrayerRequests } from './PrayerRequests';
+export { default as Settings } from './Settings';

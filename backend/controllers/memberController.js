@@ -1,125 +1,387 @@
 const Member = require('../models/Member');
-const catchAsync = require('../utils/catchAsync');
+const { uploadToS3 } = require('../utils/fileUpload');
+const { sendWelcomeEmail } = require('../utils/emailService');
+const { generateQRCode } = require('../utils/qrCodeGenerator');
 
-exports.getAllMembers = catchAsync(async (req, res) => {
-  const members = await Member.find()
-    .populate('user', 'firstName lastName email profileImage')
-    .sort('-createdAt');
-
-  res.status(200).json({
-    status: 'success',
-    results: members.length,
-    data: members
-  });
-});
-
-exports.getMember = catchAsync(async (req, res) => {
-  const member = await Member.findById(req.params.id)
-    .populate('user')
-    .populate('attendance')
-    .populate('contributions');
-
-  if (!member) {
-    return res.status(404).json({
-      status: 'error',
-      message: 'Member not found'
-    });
-  }
-
-  res.status(200).json({
-    status: 'success',
-    data: member
-  });
-});
-
-exports.createMember = catchAsync(async (req, res) => {
-  const newMember = await Member.create({
-    ...req.body,
-    membershipId: generateMembershipId()
-  });
-
-  res.status(201).json({
-    status: 'success',
-    data: newMember
-  });
-});
-
-exports.updateMember = catchAsync(async (req, res) => {
-  const member = await Member.findByIdAndUpdate(req.params.id, req.body, {
-    new: true,
-    runValidators: true
-  });
-
-  if (!member) {
-    return res.status(404).json({
-      status: 'error',
-      message: 'Member not found'
-    });
-  }
-
-  res.status(200).json({
-    status: 'success',
-    data: member
-  });
-});
-
-exports.deleteMember = catchAsync(async (req, res) => {
-  const member = await Member.findByIdAndDelete(req.params.id);
-
-  if (!member) {
-    return res.status(404).json({
-      status: 'error',
-      message: 'Member not found'
-    });
-  }
-
-  res.status(204).json({
-    status: 'success',
-    data: null
-  });
-});
-
-exports.getMemberStats = catchAsync(async (req, res) => {
-  const stats = await Member.aggregate([
-    {
-      $group: {
-        _id: null,
-        totalMembers: { $sum: 1 },
-        activeMembers: {
-          $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] }
-        },
-        inactiveMembers: {
-          $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] }
-        }
-      }
-    }
-  ]);
-
-  res.status(200).json({
-    status: 'success',
-    data: stats[0]
-  });
-});
-
-exports.getNextMemberId = async (req, res) => {
+// Create new member
+exports.createMember = async (req, res) => {
   try {
-    // Find the highest existing member ID
-    const lastMember = await Member.findOne({}, { memberId: 1 })
-      .sort({ memberId: -1 })
-      .limit(1);
+    const memberData = req.body;
+    
+    // Generate membership ID
+    memberData.membershipId = await Member.generateMembershipId();
 
-    let nextNumber = 1;
-    if (lastMember && lastMember.memberId) {
-      // Extract the number from the last ID (COPAD0001 -> 1)
-      const lastNumber = parseInt(lastMember.memberId.replace('COPAD', ''));
-      nextNumber = lastNumber + 1;
+    // Handle photo upload if exists
+    if (req.files?.photo) {
+      const photoUrl = await uploadToS3(req.files.photo, 'member-photos');
+      memberData.personalInfo.photo = photoUrl;
     }
 
-    res.json({ nextNumber });
+    const member = new Member(memberData);
+    await member.save();
+
+    // Generate QR code for member
+    const qrCode = await generateQRCode(member.membershipId);
+    
+    // Send welcome email
+    if (member.personalInfo.email) {
+      await sendWelcomeEmail(member);
+    }
+
+    res.status(201).json({
+      success: true,
+      data: member,
+      qrCode
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Get all members with filtering
+exports.getMembers = async (req, res) => {
+  try {
+    const {
+      status,
+      department,
+      role,
+      search,
+      page = 1,
+      limit = 10,
+      sort = '-createdAt'
+    } = req.query;
+
+    const query = {};
+
+    // Build query based on filters
+    if (status) query['churchInfo.membershipStatus'] = status;
+    if (department) query['churchInfo.department'] = department;
+    if (role) query['churchInfo.role'] = role;
+    if (search) {
+      query.$or = [
+        { 'personalInfo.firstName': new RegExp(search, 'i') },
+        { 'personalInfo.lastName': new RegExp(search, 'i') },
+        { membershipId: new RegExp(search, 'i') },
+        { 'personalInfo.email': new RegExp(search, 'i') }
+      ];
+    }
+
+    const members = await Member.find(query)
+      .populate('churchInfo.department')
+      .sort(sort)
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    const total = await Member.countDocuments(query);
+
+    res.json({
+      success: true,
+      data: members,
+      pagination: {
+        total,
+        page: parseInt(page),
+        pages: Math.ceil(total / limit)
+      }
+    });
   } catch (error) {
     res.status(500).json({
-      status: 'error',
-      message: 'Error generating member ID'
+      success: false,
+      message: error.message
     });
   }
-}; 
+};
+
+// Get pastoral dashboard
+exports.getPastoralDashboard = async (req, res) => {
+  try {
+    const pastorId = req.params.id;
+    const pastor = await Member.findById(pastorId);
+
+    if (!pastor || !pastor.isPastor()) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pastor not found'
+      });
+    }
+
+    const stats = await pastor.getPastoralStats();
+    
+    // Get upcoming activities
+    const upcomingActivities = await Member.aggregate([
+      { $match: { _id: pastor._id } },
+      { $unwind: '$pastoralActivities' },
+      { $match: { 
+        'pastoralActivities.date': { $gte: new Date() },
+        'pastoralActivities.status': 'scheduled'
+      }},
+      { $sort: { 'pastoralActivities.date': 1 } },
+      { $limit: 5 }
+    ]);
+
+    // Get recent sermons
+    const recentSermons = pastor.sermons
+      .sort((a, b) => b.date - a.date)
+      .slice(0, 5);
+
+    res.json({
+      success: true,
+      data: {
+        stats,
+        upcomingActivities,
+        recentSermons,
+        pastoralInfo: pastor.churchInfo.pastoralInfo
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Add pastoral activity
+exports.addPastoralActivity = async (req, res) => {
+  try {
+    const pastorId = req.params.id;
+    const activityData = req.body;
+
+    const pastor = await Member.findById(pastorId);
+    if (!pastor || !pastor.isPastor()) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pastor not found'
+      });
+    }
+
+    pastor.pastoralActivities.push(activityData);
+    await pastor.save();
+
+    res.json({
+      success: true,
+      data: pastor.pastoralActivities[pastor.pastoralActivities.length - 1]
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Add sermon
+exports.addSermon = async (req, res) => {
+  try {
+    const pastorId = req.params.id;
+    const sermonData = req.body;
+
+    // Handle file uploads if any
+    if (req.files) {
+      if (req.files.audio) {
+        sermonData.audioUrl = await uploadToS3(req.files.audio, 'sermons/audio');
+      }
+      if (req.files.video) {
+        sermonData.videoUrl = await uploadToS3(req.files.video, 'sermons/video');
+      }
+      if (req.files.document) {
+        sermonData.documentUrl = await uploadToS3(req.files.document, 'sermons/documents');
+      }
+    }
+
+    const pastor = await Member.findById(pastorId);
+    if (!pastor || !pastor.isPastor()) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pastor not found'
+      });
+    }
+
+    pastor.sermons.push(sermonData);
+    await pastor.save();
+
+    res.json({
+      success: true,
+      data: pastor.sermons[pastor.sermons.length - 1]
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Update member
+exports.updateMember = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // Handle photo upload if exists
+    if (req.files?.photo) {
+      const photoUrl = await uploadToS3(req.files.photo, 'member-photos');
+      updates.personalInfo = {
+        ...updates.personalInfo,
+        photo: photoUrl
+      };
+    }
+
+    const member = await Member.findByIdAndUpdate(
+      id,
+      updates,
+      { new: true, runValidators: true }
+    ).populate('churchInfo.department');
+
+    if (!member) {
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: member
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Delete member
+exports.deleteMember = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const member = await Member.findById(id);
+
+    if (!member) {
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found'
+      });
+    }
+
+    // Archive member instead of hard delete
+    member.churchInfo.membershipStatus = 'inactive';
+    await member.save();
+
+    res.json({
+      success: true,
+      message: 'Member archived successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Get single member
+exports.getMember = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const member = await Member.findById(id)
+      .populate('churchInfo.department')
+      .populate('attendance.event');
+
+    if (!member) {
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: member
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Update member attendance
+exports.updateAttendance = async (req, res) => {
+  try {
+    const { memberId, eventId } = req.params;
+    const { status } = req.body;
+
+    const member = await Member.findById(memberId);
+    if (!member) {
+      return res.status(404).json({
+        success: false,
+        message: 'Member not found'
+      });
+    }
+
+    const attendanceRecord = {
+      event: eventId,
+      date: new Date(),
+      status
+    };
+
+    member.attendance.push(attendanceRecord);
+    await member.save();
+
+    res.json({
+      success: true,
+      data: attendanceRecord
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Get member statistics
+exports.getMemberStats = async (req, res) => {
+  try {
+    const stats = await Member.aggregate([
+      {
+        $group: {
+          _id: '$churchInfo.membershipStatus',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const departmentStats = await Member.aggregate([
+      {
+        $unwind: '$churchInfo.department'
+      },
+      {
+        $group: {
+          _id: '$churchInfo.department',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        statusStats: stats,
+        departmentStats
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// ... more controller methods to follow ...
